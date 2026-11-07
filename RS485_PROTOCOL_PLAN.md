@@ -10,7 +10,7 @@ Project LEDJacket distributes real-time video frames from the **Central Controll
 This specification defines a **zero-flashing-at-assembly, ultra-low-overhead, deterministic RS-485 protocol** engineered specifically around the hardware capabilities of the **`PY32F003F18U6`** Cortex-M0+ MCU, **`SN65176BDQ`** RS-485 transceiver, and the **`Lattice ECP5`** FPGA transceiver array:
 
 1. **Identical Factory Firmware Across All ~1,700 Nodes**: Every `TriangleNode` is flashed once at the PCB assembly house with the exact same binary. No per-node flashing or manual ID programming is required during jacket assembly or field repairs.
-2. **99.86% Payload Efficiency at 60–100+ FPS (`Chain-Train` Slot-Indexed DMA Slicing)**: In normal streaming mode, the FPGA sends **one single contiguous frame train per chain** with a 4-byte chain header and 2-byte trailer (`0.14%` framing overhead). Each node uses hardware `USART_IDLE` line detection and two-stage DMA offset slicing to capture only its own 156-byte (RGB888) or 104-byte (RGB565) slot with $< 0.2\%$ CPU overhead and tear-free global frame latching.
+2. **99.8% Payload Efficiency at 60–100+ FPS (`Chain-Train` Slot-Indexed DMA Slicing)**: In normal streaming mode, the FPGA sends **one single contiguous frame train per chain** with a 4-byte chain header and 2-byte trailer. Each node uses hardware `USART_IDLE` line detection and two-stage DMA offset slicing to capture only its own payload slot ($396\text{ B}$ RGB888 / $264\text{ B}$ RGB565 for a 132-LED Dual-Triangle Node, or $198\text{ B}$ RGB888 / $132\text{ B}$ RGB565 per 66-LED single triangle) with $< 0.2\%$ CPU overhead and tear-free global frame latching.
 3. **Sub-Second Electronic Discovery + Fast Visual & Electrical Chain Ordering**:
    - **Phase 1 (Electronic UID Discovery, $<2.5\text{ s}$ whole jacket)**: The FPGA discovers the factory 96-bit Unique IDs (`0x1FFF0E00`) of all nodes on each chain using Slotted-Aloha + Binary-Tree prefix collision resolution.
    - **Phase 2 (Physical Chain Ordering, $k = 0\dots 26$)**: Combines **Electrical IR-Drop Gradient Pre-Sorting** (using each node's internal `1.20V` `VREFINT` ADC channel to measure cumulative $+5\text{V}$ rail sag along the daisy chain), **Interactive Visual Chase Verification** (watch a light sweep down the chain and confirm or swap out-of-order nodes in 1 click), and **Camera-Assisted Base-4 Color Gray-Code Mapping** (maps all 1,700 nodes + $\triangle/\bigtriangledown$ orientation in $< 3\text{ seconds}$).
@@ -30,11 +30,11 @@ This specification defines a **zero-flashing-at-assembly, ultra-low-overhead, de
 | **FPGA TX Topology** | **70 independent `CHAIN_TX[0..69]` pins** (all 70 chains transmit simultaneously in parallel) | **1 dedicated `IMU_TX` pin** |
 | **FPGA DE Topology** | **1 shared `GLOBAL_LED_DE` pin** (all 70 LED chains switch TX$\rightarrow$RX together during inter-frame blanking) | **1 dedicated `IMU_DE` pin** |
 | **FPGA RX Topology** | **70-to-1 Schottky Diode Wired-AND (`SHARED_RX_3V3`)** into 1 FPGA UART RX pin (only 1 chain & 1 node polled per frame) | **1 dedicated `IMU_RX` pin** |
-| **Node MCU Pins** | `PA13` = `USART1_RX` (AF8, via $1\text{k}\Omega$ from `RO`), `PA14` = `USART1_TX` (AF1, to `DI`), `PF4` = `RS485_DE` (to `DE`/`~RE`, $10\text{k}\Omega$ pull-down) | Identical `USART1` + `PF4` mapping on `IMUNode` |
+| **Node MCU Pins** | `PB7` = `USART1_RX` (AF0, from `RO`), `PB6` = `USART1_TX` (AF0, to `DI`), `PB5` = `RS485_DE` (to `DE`/`~RE`, $10\text{k}\Omega$ pull-down); `PA13`/`PA14` dedicated to `TC2030` SWD | Identical `PB7`/`PB6`/`PB5` mapping on `IMUNode` |
 | **Failsafe Idle Bias** | $4.7\text{k}\Omega$ pull-up on `A` to $+5\text{V}$, $4.7\text{k}\Omega$ pull-down on `B` to `GND` on Central Controller ($V_A - V_B > +200\text{ mV} \implies \text{RO} = \text{HIGH}$ when bus undriven) | $4.7\text{k}\Omega$ pull-up on `IMU_A`, $4.7\text{k}\Omega$ pull-down on `IMU_B` |
 
 ### 2.2 Baud Rate, Clocking, & Auto-Baud Synchronization
-- **MCU Clock Source**: On `TriangleNode`, `PF0` and `PF1` drive the shift registers (`SR_CLK`, `SR_DATA`), so `PY32F003F18U6` runs from its internal **24.0 MHz HSI RC oscillator** (multiplied/trimmed via factory calibration bytes at `0x1FFF0F00`).
+- **MCU Clock Source**: On `TriangleNode` v2.0, `PA0..PA7` (`GPIOA[7:0]`) drive the 8 parallel 1010 addressable LED strings via DMA, and `PY32F003F18U6` runs from its internal **24.0 MHz (or 32.0 MHz) HSI RC oscillator** (multiplied/trimmed via factory calibration bytes at `0x1FFF0F00`).
 - **Line Coding & Baud Rate**:
   - **8N1 NRZ UART** (1 Start bit, 8 Data bits LSB-first, No parity, 1 Stop bit = **10 bits per byte**).
   - **Primary Operating Baud Rate**: **`3.000 Mbps`** (`24.0 MHz / 8` using `USART_CR1.OVER8 = 1`, exact integer division with `0.00%` quantization error!).
@@ -62,8 +62,8 @@ Every `TriangleNode` maintains three identifiers:
 2. **Logical Chain Slot ID (`slot_id` $k \in \{0, 1, \dots, 26\}$, or `0xFF = UNASSIGNED`)**:
    - Represents the node's position ($0 = \text{first node closest to controller}$, $N-1 = \text{last node at end of chain}$) along its current chain.
    - Stored in both **SRAM** and the **final 128-byte Flash page (`0x0800FF80`)** of the `PY32F003` (alongside the bound `chain_id` $c \in \{0..69\}$, a `layout_epoch` counter, and a CRC32 check).
-3. **Why Storing the Mapping in BOTH the Central Controller AND the Node's Flash Is Best**:
-   - **Central Controller (`ESP32-C5` Flash / FPGA BRAM)** is the **Single Source of Truth**: It stores the master jacket topology table mapping `(chain_id c, slot_id k) <-> 96-bit UID` and orientation $\theta \in \{0^\circ..300^\circ\}$.
+3. **Why Storing the Mapping in BOTH the Host/FPGA AND the Node's Flash Is Best**:
+   - **Host Phone App (`jacket_topology.json`) & FPGA BRAM** serve as the **Single Source of Truth**: They store the master jacket topology table mapping `(chain_id c, slot_id k) <-> 96-bit UID` and orientation $\theta \in \{0^\circ..300^\circ\}$.
    - **Node Flash (`0x0800FF80`)** caches `(chain_id c, slot_id k, layout_epoch)`:
      - On normal power-up, nodes immediately know their `slot_id` at $t = 0\text{ ms}$ (instant boot into animations!).
      - Meanwhile, during the first 1 second after boot, the FPGA verifies all chains in the background using the fast `POLL_UID` check. If the Central Controller detects that a node was moved or replaced, it overrides the node's cached `slot_id` and updates the node's Flash only when changed (protecting Flash endurance!).
@@ -72,14 +72,14 @@ Every `TriangleNode` maintains three identifiers:
 
 ## 4. High-Bandwidth Display Streaming Protocol ("Chain-Train" Mode)
 
-### 4.1 The "Chain-Train" Packet Structure (0.14% Overhead)
+### 4.1 The "Chain-Train" Packet Structure (~0.1% Overhead)
 
 During normal 60–120 FPS video operation, the FPGA transmits **one contiguous frame train** on each of the 70 chains simultaneously:
 
 ```
 +----------+----------+------------+------------+------------------+------------------+-----+------------------+----------+----------+
 | SYNC     | CMD/MODE | POLL_ARG   | GLOB_SCALE | SLOT 0 PAYLOAD   | SLOT 1 PAYLOAD   | ... | SLOT N-1 PAYLOAD | CRC16_L  | CRC16_H  |
-| (1 Byte) | (1 Byte) | (1 Byte)   | (1 Byte)   | (156 / 104 / 52B)| (156 / 104 / 52B)|     | (156 / 104 / 52B)| (1 Byte) | (1 Byte) |
+| (1 Byte) | (1 Byte) | (1 Byte)   | (1 Byte)   | (396 / 264 /132B)| (396 / 264 /132B)|     | (396 / 264 /132B)| (1 Byte) | (1 Byte) |
 +----------+----------+------------+------------+------------------+------------------+-----+------------------+----------+----------+
 |<-------------- 4-Byte Header ---------------->|<------------------ N × Payload_Size Bytes ------------------>|<-- 2-Byte Trailer ->|
 ```
@@ -88,10 +88,10 @@ During normal 60–120 FPS video operation, the FPGA transmits **one contiguous 
 1. **`SYNC` (`1 Byte = 0x55`)**: Alternating `01010101b` preamble for receiver clock recovery / Auto-Baud verification.
 2. **`CMD` (`1 Byte`)**:
    - `Bits [7:4]` = **Packet Type (`0x1` = High-Speed Frame Stream)**:
-     - `0x10`: **`STREAM_RGB888`** — $156\text{ bytes/node}$ ($52\text{ LEDs} \times 3\text{ bytes } [R, G, B]$, 24-bit color).
-     - `0x11`: **`STREAM_RGB565`** — $104\text{ bytes/node}$ ($52\text{ LEDs} \times 2\text{ bytes}$, 16-bit `RRRRRGGG GGGBBBBB`, expanded to 8-bit gamma-corrected PWM via a 32/64-entry LUT in node SRAM).
-     - `0x12`: **`STREAM_LUT8`** — $52\text{ bytes/node}$ ($52\text{ LEDs} \times 1\text{ byte}$ palette index into a 256-color RGB24 table pre-loaded into node SRAM).
-     - `0x13`: **`STREAM_RLE_SOLID`** — $3\text{ bytes/node}$ ($1\times [R, G, B]$ solid triangle color per node = only $81\text{ bytes}$ for an entire 27-node chain! Enables **1,000+ FPS** strobe/geometric triangle effects!).
+     - `0x10`: **`STREAM_RGB888`** — $396\text{ bytes/node}$ ($132\text{ LEDs} \times 3\text{ bytes } [G, R, B]$ for a Dual-Triangle Node, or $198\text{ bytes}$ per 66-LED single triangle).
+     - `0x11`: **`STREAM_RGB565`** — $264\text{ bytes/node}$ ($132\text{ LEDs} \times 2\text{ bytes}$, 16-bit `RRRRRGGG GGGBBBBB`, expanded to 16-bit `Q8.8` linear targets via LUT in node Flash for $1,695\text{ Hz}$ Delta-Sigma dithering; or $132\text{ bytes}$ per 66-LED single triangle).
+     - `0x12`: **`STREAM_LUT8`** — $132\text{ bytes/node}$ ($132\text{ LEDs} \times 1\text{ byte}$ palette index into a 256-color RGB24 table).
+     - `0x13`: **`STREAM_RLE_SOLID`** — $6\text{ bytes/node}$ ($2\times [G, R, B]$ solid triangle colors for Triangle A and Triangle B = only $78–162\text{ bytes}$ for an entire chain! Enables **1,000+ FPS** strobe/geometric triangle effects!).
    - `Bits [3:0]` = **Piggybacked Action Flags**:
      - `Bit 0` (`POLL_EN`): If `1`, the node on the **one active polled chain** whose `slot_id == POLL_ARG[4:0]` must transmit a 10-byte Telemetry Reply immediately after the End-of-Frame `IDLE` line!
      - `Bit 1` (`SYNC_LATCH`): If `1` (normal), all nodes latch the newly received frame into their active LED display buffer simultaneously when `USART_IDLE` fires at the end of the train.
@@ -100,12 +100,12 @@ During normal 60–120 FPS video operation, the FPGA transmits **one contiguous 
    - `Bits [7:5]`: `telem_type` (`0 = Temp + Vcc + Status`, `1 = Short UID Verify`, `2 = Error Counters`, `7 = No Poll on this Chain`).
    - *Note*: Because all 70 LED chains share `SHARED_RX_3V3` via the Schottky diode Wired-AND bus, for any given video frame, the FPGA sets `POLL_EN = 1` on **exactly ONE of the 70 chains** (e.g., Chain $c = \text{frame\_num} \pmod{70}$), and sets `POLL_EN = 0` on the other 69 chains!
 4. **`GLOB_SCALE` (`1 Byte = 0x00..0xFF`)**:
-   - Master hardware brightness / power limit scalar ($0 = \text{blackout}$, $66 = \text{240W USB-PD EPR safe cap}$, $255 = \text{800W tethered full power}$).
-   - Applied by each node to its `PB6` (`SR_OE_N`) hardware timer PWM duty cycle or row gamma table, multiplied by the node's own local thermal throttling factor!
+   - Master hardware brightness / power limit scalar computed by the FPGA's hardware Automatic Brightness Limiter (ABL) based on the active USB-PD 3.1 EPR contract ($65\text{W}..240\text{W}$) or external $+5\text{V}$ supply ($800\text{W}+$).
+   - Multiplied into each node's 16-bit (`Q8.8`) $1,695\text{ Hz}$ Delta-Sigma ($\Delta\Sigma$) temporal dithering target alongside the node's own local thermal derating factor!
 
 ### 4.2 Zero-CPU Two-Stage DMA Slicing on `PY32F003`
 
-How does Node $k$ extract *only* its own $P$-byte slice (where $P \in \{156, 104, 52, 3\}$) out of the 4,218-byte train without interrupting the CPU on every byte or wasting RAM?
+How does Node $k$ extract *only* its own $P$-byte slice (where $P \in \{396, 264, 132, 6\}$ for Dual-Triangle Nodes, or $\{198, 132, 66, 3\}$ for Single-Triangle units) out of the frame train without interrupting the CPU on every byte or wasting RAM?
 
 1. **Before Frame Start (Idle State)**:
    - `DMA_Channel_RX` is configured to read `4 bytes` from `USART1->DR` into `rx_header[4]` (`MINC = ENABLED`).
@@ -114,25 +114,25 @@ How does Node $k$ extract *only* its own $P$-byte slice (where $P \in \{156, 104
    - If `CMD` is a Frame Stream (`0x10..0x13`):
      - If $k == 0$ (First node on chain): DMA immediately points to `pixel_back_buf[P]` with `MINC = ENABLED`, `CNDTR = P`.
      - If $k > 0$: DMA points to a single dummy byte `dummy_discard` with **`MINC = DISABLED` (Memory Increment OFF!)** and `CNDTR = k * P`! The DMA hardware silently consumes and discards the preceding $k \times P$ bytes belonging to upstream nodes $0 \dots k-1$ with **zero CPU intervention and 1 byte of RAM**!
-3. **Stage 2 — Prefix Discard Complete (`t = 13.3 µs + k * 520 µs`)**:
+3. **Stage 2 — Prefix Discard Complete**:
    - `DMA_TC` fires at the exact byte boundary where Slot $k$ begins!
    - The 6-instruction ISR enables `MINC = ENABLED`, points `CMAR` to `pixel_back_buf[P]`, sets `CNDTR = P`, and re-enables DMA.
-4. **Stage 3 — Slot Capture Complete (`520 µs` later)**:
+4. **Stage 3 — Slot Capture Complete**:
    - `DMA_TC` fires once all $P$ bytes of Node $k$'s pixel data are in `pixel_back_buf[P]`.
    - For the remainder of the frame train (downstream nodes $k+1 \dots N-1$), DMA is disabled (or discards to `dummy_discard`), leaving `USART_RX` enabled only to watch for the **End-of-Frame `USART_IDLE` interrupt**.
 5. **Stage 4 — End-of-Frame `USART_IDLE` Interrupt (Global Tear-Free Frame Swap + Telemetry Reply)**:
-   - When the train finishes and the line goes idle for $16\text{ bit-times}$, `USART_IDLE` fires simultaneously on all 27 nodes:
-   - Every node swaps its `pixel_front_buf` $\leftrightarrow$ `pixel_back_buf` pointer at the start of its next LED PWM multiplex cycle.
-   - If and only if `POLL_EN == 1` and `poll_slot == my_slot_id`, Node $k$ waits $10\,\mu\text{s}$ (for the FPGA to drop `GLOBAL_LED_DE = 0`), asserts its `PF4` (`RS485_DE = 1`), transmits its **10-byte Telemetry Packet** via DMA ($33.3\,\mu\text{s}$ at 3.0 Mbps), drops `PF4 = 0`, and re-arms Stage 1!
+   - When the train finishes and the line goes idle for $16\text{ bit-times}$, `USART_IDLE` fires simultaneously on all nodes:
+   - Every node verifies `CRC-16` and swaps its `pixel_front_buf` $\leftrightarrow$ `pixel_back_buf` pointer for the next $590\,\mu\text{s}$ ($1,695\text{ Hz}$) Delta-Sigma subframe.
+   - If and only if `POLL_EN == 1` and `poll_slot == my_slot_id`, Node $k$ waits $15\,\mu\text{s}$ (for the FPGA to drop `GLOBAL_LED_DE = 0`), asserts its `PB5` (`RS485_DE = 1`), transmits its **10-byte Telemetry Packet** via DMA ($33.3\,\mu\text{s}$ at 3.0 Mbps), drops `PB5 = 0`, and re-arms Stage 1!
 
-### 4.3 Frame Rate & Bandwidth Summary Table (at 3.0 Mbps, 27 Nodes/Chain)
+### 4.3 Frame Rate & Bandwidth Summary Table (at 3.0 Mbps / 4.0 Mbps, 13 Dual-Triangle Nodes = 26 Triangles/Chain)
 
-| Streaming Mode | Bytes / Node | Total Chain Bytes (27 Nodes + 6B Framing) | Wire Time per Frame (@ 3.0 Mbps) | Max Sustainable Frame Rate (with 150 µs Telemetry Window) | Protocol Overhead |
+| Streaming Mode | Bytes / Dual-Triangle Node (132 LEDs) | Total Chain Bytes (13 Dual Nodes = 26 Triangles + 6B Framing) | Wire Time @ 3.0 Mbps (4.0 Mbps) | Max Sustainable Frame Rate (with 150 µs Telemetry Window) | Protocol Overhead |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`STREAM_RGB888` (24-bit TrueColor)** | $156\text{ B}$ | $4,218\text{ B}$ | **$14.06\text{ ms}$** | **$70.3\text{ FPS}$** (60 FPS uses 84% bus capacity) | **$0.14\%$** |
-| **`STREAM_RGB565` (16-bit High-Speed)** | $104\text{ B}$ | $2,814\text{ B}$ | **$9.38\text{ ms}$** | **$105.0\text{ FPS}$** (60 FPS uses 56% bus capacity) | **$0.21\%$** |
-| **`STREAM_LUT8` (8-bit Palette)** | $52\text{ B}$ | $1,410\text{ B}$ | **$4.70\text{ ms}$** | **$206.0\text{ FPS}$** | **$0.42\%$** |
-| **`STREAM_RLE_SOLID` (Solid per Node)** | $3\text{ B}$ | $87\text{ B}$ | **$0.29\text{ ms}$** | **$1,000+\text{ FPS}$** | **$6.90\%$** |
+| **`STREAM_RGB888` (24-bit TrueColor)** | $396\text{ B}$ ($198\text{ B}/\triangle$) | $5,154\text{ B}$ | **$17.18\text{ ms}$ ($12.88\text{ ms}$)** | **$57.7\text{ FPS}$ ($76.7\text{ FPS}$ @ 4 Mbps)** | **$0.12\%$** |
+| **`STREAM_RGB565` (16-bit High-Speed)** | $264\text{ B}$ ($132\text{ B}/\triangle$) | $3,438\text{ B}$ | **$11.46\text{ ms}$ ($8.60\text{ ms}$)** | **$86.1\text{ FPS}$ ($114.3\text{ FPS}$ @ 4 Mbps)** | **$0.17\%$** |
+| **`STREAM_LUT8` (8-bit Palette)** | $132\text{ B}$ ($66\text{ B}/\triangle$) | $1,722\text{ B}$ | **$5.74\text{ ms}$ ($4.31\text{ ms}$)** | **$169.8\text{ FPS}$ ($224.2\text{ FPS}$ @ 4 Mbps)** | **$0.35\%$** |
+| **`STREAM_RLE_SOLID` (Solid per $\triangle$)** | $6\text{ B}$ ($3\text{ B}/\triangle$) | $84\text{ B}$ | **$0.28\text{ ms}$ ($0.21\text{ ms}$)** | **$1,000+\text{ FPS}$** | **$7.14\%$** |
 
 ---
 
