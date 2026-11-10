@@ -15,9 +15,10 @@ Replacing the `ESP32-C5` with the exact same **$3\times 3\text{ mm}$ `PY32F003F1
 1. **Instant-On USB-PD 3.1 EPR Negotiation & Keep-Alive (`< 2 ms` Cold Boot)**:
    - Unlike the ECP5 FPGA (which takes $\sim 50–100\text{ ms}$ to load its bitstream from SPI Flash), the `PY32F003F18U6` wakes from internal HSI in **$< 1.5\text{ ms}$** as soon as a USB-PD power bank is plugged in.
    - It immediately configures the **`HUSB239` / `TPS26750` USB-PD 3.1 EPR Sink Controller** over `I2C1` to negotiate the highest available voltage/power contract ($20\text{V} @ 3.25\text{A} = 65\text{W}$ up to $48\text{V} @ 5\text{A} = 240\text{W}$ Extended Power Range) and maintains the mandatory USB-PD 3.1 EPR keep-alive watchdog.
-2. **GaN Buck Current Monitoring & Fast Hardware Over-Current Protection (`BUCK_IMON`)**:
+2. **GaN Buck Current Monitoring, Fast Hardware OCP (`BUCK_IMON`), & Dynamic Voltage Scaling (DVS)**:
    - Continuously samples the analog current-sense output (`BUCK_IMON`) of the 3-phase **`TI LMG708B0` 48V-to-5V GaN Buck Stage** via its 12-bit hardware ADC (`PA0`) at $20\text{ kHz}$ ($50\,\mu\text{s}$ loop).
    - Provides a sub-100 µs hardware safety clamp (`FAST_THROTTLE` / `GLOBAL_LED_DE` override) if an anomalous surge ever threatens to trip the USB-PD power bank's internal over-current fuse.
+   - **Closed-Loop Dynamic Voltage Scaling (DVS, $3.5\text{V}–5.0\text{V}$)**: Dynamically adjusts the GaN buck converter output voltage in fine $25\text{ mV}$ increments via `I2C1` (driving an onboard I2C voltage trim DAC / digital potentiometer injected into the buck feedback node). By tracking the worst-case voltage sag reported by the tail nodes at the ends of all 70 chains, the MCU minimizes the voltage drop across the 1010 LEDs' internal linear drivers, slashing fabric heat dissipation by over $55\%$ while ensuring no node drops below the $3.5\text{V}$ compliance floor.
 3. **Torso Reference IMU Polling (`LSM6DSV16X` `U_IMU1`)**:
    - Polls the Central Controller's onboard **Torso Reference IMU (`LSM6DSV16X`)** over 4-wire `SPI1` (`PA4..PA7`) at **$200–400\text{ Hz}$**, running the exact same `lsm6dsv16x_spi.c` driver and `SFLP` quaternion fusion configuration as the 4 sleeve `IMUNode` boards.
    - Because the Central Controller is mounted rigidly to the wearer's chest/back torso, this 5th IMU provides the root coordinate frame ($\mathbf{q}_{\text{torso}}$) against which the 4 arm/wrist `IMUNode` quaternions are referenced!
@@ -52,7 +53,7 @@ Replacing the `ESP32-C5` with the exact same **$3\times 3\text{ mm}$ `PY32F003F1
 | `10,12..14` | `IMU_SPI_*` | `SPI1` (`PA4..PA7`) | `LSM6DSV16X` (`U_IMU1`) | $8\text{ MHz}$ 4-wire Mode 3 SPI bus for reading Torso IMU quaternions and linear acceleration. |
 | `11` | `BUCK_EN` | `GPIO_Out` (`PB5`) | `3x TI LMG708B0` Enable | Enables the high-power $+5\text{V}$ GaN buck stage only *after* USB-PD negotiation stabilizes. |
 | `15` | `EXT_5V_SENSE` | `GPIO_In` (`PA12`) | External $+5\text{V}$ Stage Jack | Detects when an external high-current $+5\text{V}$ ($800\text{W}+$) supply is connected. |
-| `1, 20` | `PD_I2C_*` | `I2C1` (`PB6/PB7`) | `HUSB239` / `TPS26750` | $400\text{ kHz}$ Fast-Mode I2C bus for USB-PD 3.1 EPR sink control & telemetry. |
+| `1, 20` | `SYS_I2C_*` | `I2C1` (`PB6/PB7`) | `HUSB239`/`TPS26750` + Buck DVS Trim DAC | $400\text{ kHz}$ Fast-Mode I2C bus for USB-PD 3.1 EPR sink control and fine-increment ($25\text{ mV}$) GaN buck output voltage scaling ($3.5\text{V}–5.0\text{V}$). |
 | `2, 3` | `FPGA_UART_*` | `USART1` (`PF0/PF1`) | `Lattice ECP5` I/O Pins | $3.000\text{ Mbps}$ full-duplex UART link to the FPGA (`MCU_Telemetry_Bridge`). |
 | `16..19` | `SWD / NRST` | `SWD` (`PA13/14, PF2/4`)| `Tag-Connect TC2030-IDC-NL` | Factory / developer pogo-pin programming and live debugging. |
 
@@ -117,36 +118,68 @@ flowchart LR
     1. **Game Rotation Vector Quaternion** `(qw, qx, qy, qz)` converted to signed 16-bit fixed-point (`Q14`, where $1.0 = 16384$).
     2. **Linear Acceleration** `(ax, ay, az)` in `mg` (gravity subtracted by hardware `SFLP`, used by the Phone to drive bounce/impact reactive shaders when the wearer jumps or dances!).
 
+### 3.4 Furniture Module 4: Dynamic Voltage Scaling (DVS) Closed-Loop Controller (`dvs_controller.c`)
+The 1010 addressable RGB LEDs (`TZ-H1010` / `XL-1010RGBC-WS2812B-S`) regulate current using internal linear constant-current sinks. The forward voltage drops are $V_{F,R} \approx 1.9\text{V}$, $V_{F,G} \approx 2.9\text{V}$, and $V_{F,B} \approx 3.1\text{V}$. With a linear sink dropout $V_{\text{drop}} \approx 0.3\text{V}$, the required local node compliance supply is only $\sim 3.40\text{V}–3.50\text{V}$. 
+- **The Heat Problem at Fixed 5.0V**: Supplying a static $+5.0\text{V}$ forces the internal linear sinks to dissipate $(5.0\text{V} - V_F) \times I_{\text{LED}}$ as pure heat into the garment fabric—wasting up to $40\%–60\%$ of total battery power in the fabric!
+- **The Cable Sag Constraint**: Ribbon cable resistance causes cumulative IR-drop down the daisy chains. Under heavy LED load, the tail node (Slot $K-1$, at the end of each chain) experiences the largest voltage sag: $V_{\text{tail}} = V_{\text{buck}} - \Delta V_{\text{chain\_sag}}$.
+- **Hardware Margin Control (`I2C1`)**:
+  - The MCU adjusts the GaN buck converter output voltage $V_{\text{buck}} \in [3.50\text{V}, 5.00\text{V}]$ in fine $25\text{ mV}$ increments (61 discrete steps) by writing to an I2C voltage margin trim DAC / digital potentiometer (e.g. `MCP4725` / `MCP4551` on `I2C1` `PB6/PB7`) that injects current into the buck feedback divider node $V_{\text{FB}}$.
+- **Closed-Loop DVS Algorithm (Runs at $50\text{ Hz}$ in Superloop)**:
+  1. **Input Telemetry**: The MCU receives the lowest measured tail node voltage $V_{\text{min,tail}} = \min_{c} \{ V_{\text{tail}}(c) \}$ and `UV_WARN` flags reported by the FPGA's prioritized tail polling engine.
+  2. **Target Headroom Setpoint**: $V_{\text{target,tail}} = 3.50\text{V}$ (configurable between $3.40\text{V}$ and $3.80\text{V}$ via Phone app).
+  3. **Error Calculation & Step Integration**:
+     $$e(t) = V_{\text{target,tail}} - V_{\text{min,tail}}$$
+     - If $e(t) > 0$ (tail node is below target, e.g. sag increased): Step $V_{\text{buck}}$ UP by $+25\text{ mV}$ (or $+100\text{ mV}$ if $e(t) > 150\text{ mV}$).
+     - If $e(t) < -50\text{ mV}$ (tail node has extra headroom, e.g. scene dimmed): Step $V_{\text{buck}}$ DOWN by $-25\text{ mV}$ with a 100 ms debounce to avoid hunting.
+  4. **Fast Feedforward Sag Anticipation**:
+     - When the FPGA increases `GLOB_SCALE` or $I_{\text{buck}}$ spikes ($\Delta I > 5\text{A}$ in $1\text{ ms}$ on `PA0`), the MCU immediately steps $V_{\text{buck}}$ up in feedforward anticipation:
+       $$\Delta V_{\text{FF}} = \text{clamp}\big(\Delta I_{\text{buck}} \times R_{\text{cable,eff}}, \; 0\text{V}, \; 0.8\text{V}\big)$$
+       This raises $V_{\text{buck}}$ *before* the tail nodes sag, eliminating transient color shifts.
+  5. **Emergency Fast Under-Voltage Boost**:
+     - If any node reports an under-voltage warning (`UV_WARN = 1`, $V_{\text{node}} < 3.40\text{V}$), the MCU bypasses rate limits and boosts $V_{\text{buck}}$ by $+250\text{ mV}$ within $< 2\text{ ms}$.
+  6. **Slew-Rate Limiting**:
+     - Maximum downward slew rate is bounded to $\le 2.5\text{ V/s}$ ($25\text{ mV} / 10\text{ ms}$) to prevent inductor/capacitor ringing on long power harness traces.
+
 ---
 
 ## 4. How the Central Controller MCU Sends IMU & Power Data Back to the FPGA and Phone
 
 To ensure the Torso IMU sample is time-aligned with the 4 Sleeve `IMUNode` samples, the FPGA and Central Controller MCU use a synchronized **$200\text{ Hz}$ ($5.0\text{ ms}$) / $400\text{ Hz}$ ($2.5\text{ ms}$) UART Frame Exchange** at **$3.000\text{ Mbps}$** on `PF0`/`PF1`:
 
-### 4.1 Synchronized Trigger & Upstream Frame Format (`MCU -> FPGA`)
-Every $5.0\text{ ms}$ (at the exact same clock cycle that the FPGA broadcasts `CMD_IMU_POLL` on `IMU_BUS` to the 4 sleeve `IMUNode`s), the FPGA pulses a 1-byte trigger (`0xA5`) on `FPGA_UART_RX` (`PF1`). The Central Controller MCU immediately latches its latest `LSM6DSV16X` quaternion + ADC power readings and transmits a **24-byte `RSP_CC_STATUS` frame** to the FPGA via `USART1_TX` DMA ($80\,\mu\text{s}$ wire time at $3.0\text{ Mbps}$):
+### 4.1 Synchronized Trigger & Bidirectional Exchange (`FPGA <-> MCU`)
+1. **Downstream Trigger from FPGA (`FPGA -> MCU`, 6 Bytes)**:
+   Every $5.0\text{ ms}$, the FPGA sends a 6-byte trigger frame to the Central Controller MCU over `FPGA_UART_RX` (`PF1`):
+   - `[0] SYNC = 0xA5`
+   - `[1..2] VMIN_TAIL_MV` (uint16_le: minimum tail-node voltage across all 70 chains, in mV)
+   - `[3] VMIN_TAIL_CHAIN` (uint8_t: ID 0..69 of the chain with the lowest tail voltage)
+   - `[4] ABL_GLOB_SCALE` (uint8_t: active FPGA brightness scaling factor 0..255)
+   - `[5] CRC8`
+2. **Upstream Response from MCU (`MCU -> FPGA`, 28 Bytes)**:
+   The Central Controller MCU immediately latches its latest `LSM6DSV16X` quaternion, ADC power readings, and active buck output voltage $V_{\text{buck}}$, transmitting a **28-byte `RSP_CC_STATUS` frame** via `USART1_TX` DMA ($93.3\,\mu\text{s}$ wire time at $3.0\text{ Mbps}$):
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-|                   CENTRAL CONTROLLER MCU -> FPGA TELEMETRY FRAME (24 Bytes @ 200 Hz)              |
+|                   CENTRAL CONTROLLER MCU -> FPGA TELEMETRY FRAME (28 Bytes @ 200 Hz)              |
 +-------------+---------------+---------------------------------------------------------------------+
 | Byte Offset | Field Name    | Description                                                         |
 +-------------+---------------+---------------------------------------------------------------------+
 | 0           | SYNC          | 0x55 (Auto-Baud / Frame Lock)                                       |
 | 1           | OPCODE        | 0x61 (RSP_CC_STATUS)                                                |
 | 2           | SEQ_NUM       | Rolling sequence number (0..255)                                    |
-| 3           | PWR_FLAGS     | [0]=PD_READY, [1]=EPR_MODE, [2]=EXT_5V, [3]=OCP_WARN, [4]=OTP_WARN  |
-| 4..5        | VBUS_MV       | uint16_le: Negotiated USB-PD Voltage in mV (e.g., 48000 = 48.0V)    |
-| 6..7        | IBUS_MAX_MA   | uint16_le: Negotiated USB-PD Current Limit in mA (e.g., 5000 = 5.0A)|
-| 8..9        | BUCK_IMON_10MA| uint16_le: Live Measured +5V Buck Current in 10 mA steps (0..250A)  |
-| 10          | CC_TEMP_C     | int8_t: Central Controller PCB / Buck Temperature in deg C          |
-| 11          | THERM_SCALE   | uint8_t: Recommended Buck Thermal Scale (0..255, 255 = 100%)        |
-| 12..13      | TORSO_QW      | int16_le: Torso Quaternion W (Q14 fixed-point: -16384..+16384)      |
-| 14..15      | TORSO_QX      | int16_le: Torso Quaternion X (Q14 fixed-point: -16384..+16384)      |
-| 16..17      | TORSO_QY      | int16_le: Torso Quaternion Y (Q14 fixed-point: -16384..+16384)      |
-| 18..19      | TORSO_QZ      | int16_le: Torso Quaternion Z (Q14 fixed-point: -16384..+16384)      |
-| 20..21      | TORSO_AZ_MG   | int16_le: Vertical Linear Acceleration (jump/beat impact in mg)     |
-| 22..23      | CRC16         | uint16_le: CRC-16/CCITT (poly 0x1021) over Bytes 0..21              |
+| 3           | PWR_FLAGS     | [0]=PD_READY, [1]=EPR_MODE, [2]=EXT_5V, [3]=OCP_WARN, [4]=DVS_ACTIVE|
+| 4..5        | VBUS_MV       | uint16_le: Negotiated USB-PD Input Voltage in mV (e.g. 48000 = 48V)|
+| 6..7        | IBUS_MAX_MA   | uint16_le: Negotiated USB-PD Current Limit in mA (e.g. 5000 = 5.0A) |
+| 8..9        | BUCK_IMON_10MA| uint16_le: Live Measured Buck Output Current in 10 mA steps (0..250A)|
+| 10..11      | VBUCK_OUT_MV  | uint16_le: Active GaN Buck Output Voltage in mV (3500..5000 mV)     |
+| 12          | CC_TEMP_C     | int8_t: Central Controller PCB / Buck Temperature in deg C          |
+| 13          | THERM_SCALE   | uint8_t: Recommended Buck Thermal Scale (0..255, 255 = 100%)        |
+| 14..15      | TORSO_QW      | int16_le: Torso Quaternion W (Q14 fixed-point: -16384..+16384)      |
+| 16..17      | TORSO_QX      | int16_le: Torso Quaternion X (Q14 fixed-point: -16384..+16384)      |
+| 18..19      | TORSO_QY      | int16_le: Torso Quaternion Y (Q14 fixed-point: -16384..+16384)      |
+| 20..21      | TORSO_QZ      | int16_le: Torso Quaternion Z (Q14 fixed-point: -16384..+16384)      |
+| 22..23      | TORSO_AZ_MG   | int16_le: Vertical Linear Acceleration (jump/beat impact in mg)     |
+| 24..25      | DVS_SAVED_W   | uint16_le: Estimated Linear Driver Heat Dissipation Saved in 0.1 W  |
+| 26..27      | CRC16         | uint16_le: CRC-16/CCITT (poly 0x1021) over Bytes 0..25              |
 +---------------------------------------------------------------------------------------------------+
 ```
 

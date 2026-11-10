@@ -180,12 +180,26 @@ Every `Chain-Train` video broadcast on a chain begins with a 4-byte header (`0x5
      - **Stage 3 (Discard Downstream Bytes)**: `MINC = 0` is restored until `USART_IDLE` fires to latch the frame globally.
 
 ### 5.2 Returning Piggybacked Temperature & Voltage Telemetry (`RSP_TELEMETRY = 0x81`)
-- **Supply-Independent Die Temperature & $+5\text{V}$ Measurement**:
-  - Because `TriangleNode` v2.0 powers the `PY32F003` directly from the $+5.0\text{V}$ rail (which sags due to cable IR drop under heavy LED load), raw ADC counts are scaled against the MCU's internal **$1.20\text{V}$ bandgap reference (`ADC_IN12 = VREFINT`)**:
+- **Supply-Independent Die Temperature & Dynamic Rail Voltage Measurement ($3.5\text{V}–5.0\text{V}$)**:
+  - Because `TriangleNode` v2.0 powers both the `PY32F003` MCU and the 132 addressable 1010 RGB LEDs directly from the variable buck supply rail ($V_{DD} \in [3.50\text{V}, 5.00\text{V}]$, which experiences load-dependent cable IR-drop), raw ADC counts cannot rely on an assumed fixed $+5.0\text{V}$ reference.
+  - Instead, the 12-bit ADC continuously references the MCU's internal **$1.20\text{V}$ bandgap reference (`ADC_IN12 = VREFINT`)**:
     $$V_{DD,\text{mV}} = \frac{1200 \times 4095}{\text{ADC}_{\text{VREFINT}}}, \qquad V_{\text{TSense,mV}} = \frac{\text{ADC}_{\text{CH11}} \times 1200}{\text{ADC}_{\text{VREFINT}}}$$
-    This yields both the exact die temperature ($0.5^\circ\text{C}$ resolution) and the exact local $+5\text{V}$ supply voltage ($20\text{ mV}$ resolution) with **zero external thermistors or voltage dividers**!
-- **Piggybacked Response**:
-  - If `POLL_CFG` in the `Chain-Train` header has `POLL_EN == 1` (Bit 7) and `POLL_SLOT == my_slot_id` (Bits `6:0`), this node waits $15\,\mu\text{s}$ after `USART_IDLE`, asserts `RS485_DE = 1` (`PB5`), transmits its **10-byte `RSP_TELEMETRY` packet** ($33.3\,\mu\text{s}$ at $3.0\text{ Mbps}$), and releases `RS485_DE = 0` inside the $150\,\mu\text{s}$ inter-frame blanking window.
+    This provides high-accuracy, supply-independent voltage monitoring ($20\text{ mV}$ resolution) and die temperature measurements ($0.5^\circ\text{C}$ resolution) across the entire dynamic $3.5\text{V}–5.0\text{V}$ operating range with **zero external voltage dividers or precision thermistors**.
+- **Tail-Node Headroom & Dynamic Voltage Scaling (DVS) Support**:
+  - **Tail-Node Self-Awareness**: During commissioning, each node records its assigned `slot_id` ($k$) and the total chain length ($K$). If $k == K-1$, the node sets an internal flag `is_tail_node = 1`.
+  - **Under-Voltage Warning (`UV_WARN`)**: If local $V_{DD}$ sags below $3.40\text{V}$ (approaching the compliance dropout knee of the Blue LED linear drivers at $3.1\text{V} + 0.3\text{V}$), the node immediately sets the `UV_WARN` flag (Bit 6) in its telemetry status byte.
+  - **Linear Driver Heat Elimination**: Operating at $3.5\text{V}–3.8\text{V}$ eliminates over $55\%$ of waste heat in the 1010 LED packages compared to fixed 5.0V operation. Because both the `PY32F003` logic and the 1010 internal control ICs are powered from the same rail, $V_{OH} \approx V_{DD}$ and $V_{IH} \approx 0.7 V_{DD}$ track each other symmetrically, guaranteeing robust WS2812 signal integrity down to $3.5\text{V}$.
+- **Piggybacked Response Format (10 Bytes)**:
+  - If `POLL_CFG` in the `Chain-Train` header has `POLL_EN == 1` (Bit 7) and `POLL_SLOT == my_slot_id` (Bits `6:0`), this node waits $15\,\mu\text{s}$ after `USART_IDLE`, asserts `RS485_DE = 1` (`PB5`), and transmits via DMA:
+    - `Byte 0`: `0x55` (Preamble / Sync)
+    - `Byte 1`: `0x81` (`RSP_TELEMETRY`)
+    - `Byte 2`: `my_slot_id` ($0\dots 26$)
+    - `Byte 3`: `STATUS_FLAGS` (Bit 7 = `IS_TAIL_NODE`, Bit 6 = `UV_WARN`, Bit 5 = `OTP_WARN`, Bits 4:0 = `ERR_COUNT`)
+    - `Byte 4`: `TEMP_HALF_C` (Die temp: $\text{deg C} = \text{val} \times 0.5 - 20$)
+    - `Byte 5`: `VDD_20MV` (Local rail: $V_{\text{node,mV}} = 2800 + \text{val} \times 20$, covering $2.80\text{V}–5.50\text{V}$)
+    - `Byte 6..7`: `PEAK_SAG_MV` (Maximum recorded $V_{\text{sag}} = V_{\text{idle}} - V_{\text{load}}$ on this frame in mV)
+    - `Byte 8..9`: `CRC-16/CCITT` over Bytes 0..7
+  - Releases `RS485_DE = 0` within $33.3\,\mu\text{s}$, well inside the $150\,\mu\text{s}$ inter-frame blanking window.
 
 ---
 

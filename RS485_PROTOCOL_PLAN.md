@@ -96,11 +96,11 @@ During normal 60–120 FPS video operation, the FPGA transmits **one contiguous 
      - `Bit 0` (`POLL_EN`): If `1`, the node on the **one active polled chain** whose `slot_id == POLL_ARG[4:0]` must transmit a 10-byte Telemetry Reply immediately after the End-of-Frame `IDLE` line!
      - `Bit 1` (`SYNC_LATCH`): If `1` (normal), all nodes latch the newly received frame into their active LED display buffer simultaneously when `USART_IDLE` fires at the end of the train.
 3. **`POLL_ARG` (`1 Byte`)**:
-   - `Bits [4:0]`: `poll_slot` ($0\dots 26$) — selects which node on this chain is being queried for temperature/voltage telemetry on this frame.
-   - `Bits [7:5]`: `telem_type` (`0 = Temp + Vcc + Status`, `1 = Short UID Verify`, `2 = Error Counters`, `7 = No Poll on this Chain`).
+   - `Bits [4:0]`: `poll_slot` ($0\dots 26$) — selects which node on this chain is being queried for telemetry on this frame. To support **Dynamic Voltage Scaling (DVS)**, the FPGA alternates between querying the **tail node** ($k = K-1$, which experiences the maximum cumulative IR-drop) and querying interior nodes round-robin.
+   - `Bits [7:5]`: `telem_type` (`0 = Headroom & Temp (DVS mode)`, `1 = Short UID Verify`, `2 = Error Counters`, `7 = No Poll on this Chain`).
    - *Note*: Because all 70 LED chains share `SHARED_RX_3V3` via the Schottky diode Wired-AND bus, for any given video frame, the FPGA sets `POLL_EN = 1` on **exactly ONE of the 70 chains** (e.g., Chain $c = \text{frame\_num} \pmod{70}$), and sets `POLL_EN = 0` on the other 69 chains!
 4. **`GLOB_SCALE` (`1 Byte = 0x00..0xFF`)**:
-   - Master hardware brightness / power limit scalar computed by the FPGA's hardware Automatic Brightness Limiter (ABL) based on the active USB-PD 3.1 EPR contract ($65\text{W}..240\text{W}$) or external $+5\text{V}$ supply ($800\text{W}+$).
+   - Master hardware brightness / power limit scalar computed by the FPGA's hardware Automatic Brightness Limiter (ABL) based on the active USB-PD 3.1 EPR contract ($65\text{W}..240\text{W}$) or external $+5\text{V}$ supply ($800\text{W}+$) and the active buck output voltage $V_{\text{buck}} \in [3.50\text{V}, 5.00\text{V}]$.
    - Multiplied into each node's 16-bit (`Q8.8`) $1,695\text{ Hz}$ Delta-Sigma ($\Delta\Sigma$) temporal dithering target alongside the node's own local thermal derating factor!
 
 ### 4.2 Zero-CPU Two-Stage DMA Slicing on `PY32F003`
@@ -160,7 +160,8 @@ Whenever the upper nibble of `CMD` is **not** `0x1` (i.e. `CMD >= 0x20`), the pa
 | **`0x10..0x13`** | `STREAM_RGB*` | FPGA $\rightarrow$ Chain | High-speed concatenated video frame train + optional piggybacked slot poll. |
 | **`0x20`** | `CMD_TEST_MODE` | FPGA $\rightarrow$ Node/All | Triggers built-in autonomous test pattern (`mode`: RGB sequence, white fade, corner orientation mark, number blink) and/or returns self-test telemetry. |
 | **`0x21`** | `CMD_POLL_STATUS` | FPGA $\rightarrow$ Node | Explicit status/temperature/voltage/UID request outside video streaming. |
-| **`0x22`** | `RSP_TELEMETRY` | Node $\rightarrow$ FPGA | 10-byte or 22-byte node telemetry & status response. |
+| **`0x22 / 0x81`** | `RSP_TELEMETRY` | Node $\rightarrow$ FPGA | 10-byte node telemetry response: `[0x55, 0x81, slot_id, status_flags, temp_half_c, vdd_20mv, peak_sag_mv(2B), crc16(2B)]`. Flags include `IS_TAIL_NODE` (Bit 7) and `UV_WARN` (Bit 6) for Dynamic Voltage Scaling. |
+| **`0x23`** | `CMD_CFG_DVS` | FPGA $\rightarrow$ Node/Chain | Broadcasts Dynamic Voltage Scaling target setpoints and voltage warning thresholds to nodes. |
 | **`0x30`** | `CMD_DISC_RESET` | FPGA $\rightarrow$ Chain | Resets discovery state (`discovery_muted = 0`) on all nodes (or only `UNASSIGNED` nodes) on the chain. |
 | **`0x31`** | `CMD_DISC_SLOTS` | FPGA $\rightarrow$ Chain | Initiates a 32-slot or 64-slot Slotted-Aloha UID discovery round with `round_seed`. |
 | **`0x32`** | `CMD_DISC_TREE` | FPGA $\rightarrow$ Chain | Deterministic binary prefix-tree query (`bit_len`, `prefix_bits[]`) to resolve any remaining UID collisions with 100% mathematical certainty. |

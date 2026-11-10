@@ -93,9 +93,13 @@ Every video frame (or control command) sent from the Phone to the FPGA over the 
    - `0x04` (`FMT_SOLID_NODE`): **Solid/Gradient Per-Triangle Mode** ($6\text{ B/node}$: `GRB_TriangleA[3]`, `GRB_TriangleB[3]`).
    - `0x10` (`CMD_PASSTHROUGH`): Direct RS-485 command injection from the phone (used during Commissioning, Aloha Discovery, Visual Chase, and Factory Test Mode).
    - `0x20` (`CFG_TOPOLOGY`): Updates the FPGA's per-chain active node count table (`chain_len[0..69]`) and power ceiling override.
+   - `0x21` (`CFG_DVS`): Dynamic Voltage Scaling configuration: payload contains `dvs_mode` (`0x01` = Closed-Loop Auto Headroom, `0x00` = Fixed 5.0V), `target_tail_mv` (e.g. 3500 mV), and `max_voltage_step_mv` (25 mV default).
 3. **`FRAME_SEQ` (`1 Byte`)**: Rolling $0..255$ frame counter; echoed back in the FPGA's upstream USB telemetry packet so the phone can measure exact round-trip USB pipeline latency.
 4. **`USER_BRIGHT` (`1 Byte`)**: User-selected master brightness fader ($0..255$). The FPGA multiplies this by its hardware Automatic Brightness Limiter (`ABL_SCALE`) to produce the final `GLOB_SCALE` byte transmitted to the nodes.
-5. **`POLL_CFG` (`1 Byte`)**: Bit 7 = `AUTO_RR_POLL` ($1 =$ FPGA automatically round-robin polls node temperatures; $0 =$ phone specifies explicit chain/slot).
+5. **`POLL_CFG` (`1 Byte`)**:
+   - `Bit 7` = `AUTO_POLL_EN` ($1 =$ FPGA automatically executes prioritized dual-phase tail-node & round-robin sweeps).
+   - `Bit 6` = `DVS_PRIORITY_POLL` ($1 =$ dedicate alternating video frames to polling tail nodes for tightest DVS loop tracking).
+   - `Bits 5:0` = Reserved / explicit chain target.
 
 ### 3.3 Why the USB Payload is Byte-Interleaved Across All 70 Chains
 Inside the Superframe payload, data for the 70 RS-485 chains is packed in **70-Way Byte-Interleaved Order**:
@@ -157,11 +161,11 @@ What if an external VJ laptop (running Resolume Arena or TouchDesigner) streams 
 
 ## 5. Upstream Telemetry Protocol (FPGA $\rightarrow$ Phone Bulk-IN)
 
-While the Phone sends video frames downstream, the FPGA continuously aggregates hardware telemetry and sends a fixed-size **64-byte Upstream Telemetry Packet** back to the Phone over the `FT2232H` Synchronous FIFO IN channel at **$200\text{ Hz}$** (every $5.0\text{ ms}$, synchronized to the IMU sample tick):
+While the Phone sends video frames downstream, the FPGA continuously aggregates hardware telemetry and sends a fixed-size **72-byte Upstream Telemetry Packet** back to the Phone over the `FT2232H` Synchronous FIFO IN channel at **$200\text{ Hz}$** (every $5.0\text{ ms}$, synchronized to the IMU sample tick):
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-|                        UPSTREAM USB TELEMETRY PACKET (64 Bytes @ 200 Hz)                          |
+|                        UPSTREAM USB TELEMETRY PACKET (72 Bytes @ 200 Hz)                          |
 +-------------+-------------+-----------------------------------------------------------------------+
 | Byte Offset | Field Name  | Description                                                           |
 +-------------+-------------+-----------------------------------------------------------------------+
@@ -169,23 +173,34 @@ While the Phone sends video frames downstream, the FPGA continuously aggregates 
 | 4           | PKT_TYPE    | 0x81 = Periodic 200 Hz Telemetry; 0x82 = Aloha Discovery Reply        |
 | 5           | LAST_F_SEQ  | Echoes last latched video `FRAME_SEQ` (for RTT latency monitoring)    |
 | 6..7        | SYS_STATUS  | Bitflags: [0]=PD_OK, [1]=EXT_5V, [2]=ABL_ACTIVE, [3]=OTP_WARN, [4]=OCP|
-| 8..9        | VBUS_MV     | Negotiated USB-PD / Input Voltage in mV (e.g., 48000 = 48.0V)         |
-| 10..11      | IBUS_MA     | Negotiated PD Current Ceiling in mA (e.g., 5000 = 5.0A)               |
-| 12..13      | BUCK_IMON_MA| Live Measured 5V GaN Buck Output Current in 10 mA units (0..250.0A)   |
-| 14          | GLOB_SCALE  | Active Hardware ABL Brightness Scale applied by FPGA (0..255)         |
-| 15          | CC_TEMP_C   | Central Controller PCB / GaN Buck Temperature in deg C                |
-| 16..23      | IMU0_TORSO  | Central Controller Torso Quaternion (qw, qx, qy, qz as int16 Q14)     |
-| 24..31      | IMU1_L_UPP  | Left Upper Arm Quaternion (qw, qx, qy, qz as int16 Q14)               |
-| 32..39      | IMU2_L_WRT  | Left Forearm/Wrist Quaternion (qw, qx, qy, qz as int16 Q14)           |
-| 40..47      | IMU3_R_UPP  | Right Upper Arm Quaternion (qw, qx, qy, qz as int16 Q14)              |
-| 48..55      | IMU4_R_WRT  | Right Forearm/Wrist Quaternion (qw, qx, qy, qz as int16 Q14)          |
-| 56          | POLL_CHAIN  | Chain ID (0..69) of the latest round-robin node telemetry sample      |
-| 57          | POLL_SLOT   | Node Slot ID (0..26) of the latest round-robin node telemetry sample  |
-| 58          | NODE_TEMP   | Reported Node Temperature in 0.5 deg C steps (`temp_c = val*0.5 - 20`)|
-| 59          | NODE_VDD    | Reported Node Local +5V Rail in 20 mV steps (`v_mv = 3000 + val*20`)  |
-| 60..63      | CRC32       | IEEE 802.3 CRC-32 over Bytes 0..59                                    |
+|             |             |           [5]=DVS_ACTIVE, [6]=UV_WARN, [7]=RESERVED                   |
+| 8..9        | VBUS_MV     | Negotiated USB-PD / Input Voltage in mV (e.g. 48000 = 48.0V)          |
+| 10..11      | IBUS_MA     | Negotiated PD Current Ceiling in mA (e.g. 5000 = 5.0A)                |
+| 12..13      | BUCK_IMON_MA| Live Measured GaN Buck Output Current in 10 mA units (0..250.0A)      |
+| 14..15      | VBUCK_MV    | Active Dynamically Trimmed Buck Output Voltage in mV (3500..5000 mV)  |
+| 16..17      | VMIN_TAIL_MV| Lowest Measured Voltage across all 70 Tail Nodes in mV (2800..5000 mV)|
+| 18          | TAIL_CHAIN  | Chain ID (0..69) experiencing the worst-case voltage sag              |
+| 19          | GLOB_SCALE  | Active Hardware ABL Brightness Scale applied by FPGA (0..255)         |
+| 20          | CC_TEMP_C   | Central Controller PCB / GaN Buck Temperature in deg C                |
+| 21          | THERM_SCALE | Buck Thermal Throttling Scale (0..255, 255 = 100%)                    |
+| 22..29      | IMU0_TORSO  | Central Controller Torso Quaternion (qw, qx, qy, qz as int16 Q14)     |
+| 30..37      | IMU1_L_UPP  | Left Upper Arm Quaternion (qw, qx, qy, qz as int16 Q14)               |
+| 38..45      | IMU2_L_WRT  | Left Forearm/Wrist Quaternion (qw, qx, qy, qz as int16 Q14)           |
+| 46..53      | IMU3_R_UPP  | Right Upper Arm Quaternion (qw, qx, qy, qz as int16 Q14)              |
+| 54..61      | IMU4_R_WRT  | Right Forearm/Wrist Quaternion (qw, qx, qy, qz as int16 Q14)          |
+| 62          | POLL_CHAIN  | Chain ID (0..69) of the latest round-robin node telemetry sample      |
+| 63          | POLL_SLOT   | Node Slot ID (0..26) of the latest round-robin node telemetry sample  |
+| 64          | NODE_TEMP   | Reported Node Temperature in 0.5 deg C steps (`temp_c = val*0.5 - 20`)|
+| 65          | NODE_VDD    | Reported Node Local Rail in 20 mV steps (`v_mv = 2800 + val*20`)      |
+| 66..67      | DVS_SAVED_W | Estimated Real-Time Linear Driver Heat Saved in 0.1 W units           |
+| 68..71      | CRC32       | IEEE 802.3 CRC-32 over Bytes 0..67                                    |
 +-------------+-------------+-----------------------------------------------------------------------+
 ```
 
-- **Bandwidth**: $64\text{ Bytes} \times 200\text{ Hz} = \mathbf{12.8\text{ kB/s}}$ ($0.03\%$ of the $40\text{ MB/s}$ FIFO bandwidth).
-- **Sub-Millisecond Flushing**: Whenever the FPGA finishes writing the 64th byte into the `FT2232H` FIFO, it pulses the `SIWU#` (Send Immediate / WakeUp) pin low for 1 clock cycle, forcing the `FT2232H` USB engine to dispatch the USB Bulk-IN packet on the very next $125\,\mu\text{s}$ USB 2.0 High-Speed microframe instead of waiting for the FTDI latency timer!
+- **Bandwidth**: $72\text{ Bytes} \times 200\text{ Hz} = \mathbf{14.4\text{ kB/s}}$ ($0.036\%$ of the $40\text{ MB/s}$ FIFO bandwidth).
+- **Sub-Millisecond Flushing**: Whenever the FPGA finishes writing the 72nd byte into the `FT2232H` FIFO, it pulses the `SIWU#` (Send Immediate / WakeUp) pin low for 1 clock cycle, forcing the `FT2232H` USB engine to dispatch the USB Bulk-IN packet on the very next $125\,\mu\text{s}$ USB 2.0 High-Speed microframe instead of waiting for the FTDI latency timer!
+- **Phone App Display & Closed-Loop Telemetry**:
+  - The Android companion app exposes a live power and thermal monitor displaying:
+    1. Active GaN buck output voltage ($V_{\text{buck}}$, e.g. $3.75\text{V}$ vs. nominal $5.00\text{V}$).
+    2. Worst-case tail node voltage ($V_{\text{min,tail}}$, e.g. $3.52\text{V}$) and identifies the most heavily loaded chain (`TAIL_CHAIN`).
+    3. Estimated real-time linear driver power saved: $P_{\text{saved}} = (5.0\text{V} - V_{\text{buck}}) \times I_{\text{buck}}$ (typically **$30\text{W}–90\text{W}$ of heat prevented from entering the jacket fabric**!).

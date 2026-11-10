@@ -116,15 +116,18 @@ How do 70 RS-485 chains report node temperatures back to the FPGA using only **1
    - All 70 `SN65176BDQ` `RO` outputs are idle-HIGH ($+5.0\text{V}$).
    - Each `RO` pin connects to the cathode of a low-$V_F$ Schottky diode (`RB521S-30`, $V_F \approx 0.25\text{V}$). All 70 anodes join at `SHARED_LED_RO` with a $1\text{k}\Omega$ pull-up to $+3.3\text{V}$.
    - When 69 chains are idle (`RO = 5V`), their diodes are reverse-biased. When the 1 polled node transmits a `'0'` (`RO = 0V`), its diode pulls `SHARED_LED_RO` down to $0.25\text{V}$ (a clean logic `'0'` at the $3.3\text{V}$ FPGA input!).
-2. **Round-Robin Header Injection**:
-   - On Frame $f$, the FPGA's `RR_Scheduler` selects:
-     $$\text{Polled Chain } c^* = f \bmod 70, \qquad \text{Polled Slot } k^* = \left\lfloor \frac{f}{70} \right\rfloor \bmod N_{\text{nodes}}(c^*)$$
+2. **Round-Robin & Prioritized Tail-Node Header Injection**:
+   - The FPGA maintains an active chain length table `chain_len[0..69]` where `tail_slot[c] = chain_len[c] - 1`.
+   - Because tail nodes experience the worst-case cumulative cable IR-drop and define the compliance limit for Dynamic Voltage Scaling (DVS), the FPGA's telemetry scheduler operates in **Dual-Phase Prioritized Polling Mode**:
+     - **Even Frames ($f = 2m$) — Tail-Node Headroom Sweep**: The FPGA queries the **tail node** of Chain $c^* = m \bmod 70$ at Slot $k^* = \text{tail\_slot}[c^*]$. All 70 tail nodes are refreshed once every 140 frames ($2.33\text{ s}$ at 60 FPS).
+     - **Odd Frames ($f = 2m+1$) — General Interior Sweep**: The FPGA queries interior nodes round-robin for distributed garment temperature mapping.
    - In the 4-byte `Chain-Train` header (`0x55`, `CMD_FRAME_DATA`, `GLOB_SCALE`, `POLL_CFG`), **only Chain $c^*$** has bit 7 of `POLL_CFG` set (`POLL_CFG = 0x80 | k^*`). All other 69 chains transmit `POLL_CFG = 0x00` (`POLL_EN = 0`).
-3. **$150\,\mu\text{s}$ Inter-Frame Turnaround Window**:
+3. **$150\,\mu\text{s}$ Inter-Frame Turnaround Window & $V_{\text{min,tail}}$ Tracking**:
    - Immediately after the `EOF_IDLE` latch period, the FPGA drives `GLOBAL_LED_DE = 0` for **$150\,\mu\text{s}$**.
    - At $T_{\text{EOF}} + 15\,\mu\text{s}$, Node $k^*$ on Chain $c^*$ transmits its 10-byte `RSP_TELEMETRY` packet ($33.3\,\mu\text{s}$ duration at $3.0\text{ Mbps}$).
-   - The FPGA's `Shared_RO_UART_RX` verifies the `CRC-16` of the 10-byte reply and writes `{temp_half_c, vdd_20mv, flags}` into `Telemetry_BRAM[c^*][k^*]`.
-   - At $60\text{ FPS}$, all $70$ chains are polled every $1.17\text{ seconds}$, and every node on the jacket is refreshed every $15–30\text{ seconds}$ (more than $10\times$ faster than thermal time constants). Furthermore, the FPGA can prioritize polling the hottest known nodes more frequently.
+   - The FPGA's `Shared_RO_UART_RX` verifies the `CRC-16` of the 10-byte reply, writes `{temp_half_c, vdd_20mv, flags}` into `Telemetry_BRAM[c^*][k^*]`, and if $k^* == \text{tail\_slot}[c^*]$, updates its hardware **Worst-Case Tail Voltage Comparator**:
+     $$V_{\text{min,tail}} = \min_{c \in \{0..69\}} \Big( \text{Telemetry\_BRAM}[c][\text{tail\_slot}[c]].V_{DD} \Big)$$
+   - Every $5.0\text{ ms}$ ($200\text{ Hz}$), the FPGA streams $V_{\text{min,tail}}$ and the weakest chain ID to the Central Controller MCU inside the 6-byte downstream UART sync frame, closing the real-time DVS control loop!
 
 ---
 
@@ -138,16 +141,17 @@ Throttling is split across **four coordinated hardware/firmware tiers**, ordered
 
 | Tier | Executing Component | Control Loop Rate | Input Signals | Throttling Action | Purpose |
 | :--- | :--- | :---: | :--- | :--- | :--- |
-| **Tier 1: Supply Contract Ceiling** | **Central Controller MCU (`PY32F003`)** | $100\text{ Hz}$ (and on PD attach IRQ) | `HUSB239` / `TPS26750` I2C PDO registers + `EXT_5V_SENSE` GPIO | Sends `P_max_watts` & `I_5V_max_amps` to FPGA over SPI/UART. | Adapts dynamically to whether $65\text{W}$, $100\text{W}$, $140\text{W}$, $240\text{W}$ EPR, or $800\text{W}$ external $+5\text{V}$ is plugged in. |
-| **Tier 2: Frame-by-Frame Hardware ABL** | **FPGA Gateware (`abl_engine.sv`)** | **$60–120\text{ Hz}$ (Every Video Frame, $0\text{ ms}$ lag)** | Exact sum of incoming frame `(R + G + B)` + quiescent power baseline + Tier 1 `I_5V_max` + max buck/jacket temp | Computes 8-bit **`GLOB_SCALE` ($0..255$)** embedded in Byte 2 of every `Chain-Train` frame header. | Allows sparse effects (sparks, text, outlines) to run at **100% full 24-bit brightness**, while smoothly scaling down full-jacket white flashes so total current never exceeds `I_5V_max`. |
+| **Tier 1: Supply Contract & Dynamic Voltage Scaling (DVS)** | **Central Controller MCU (`PY32F003`)** | $50–100\text{ Hz}$ | `HUSB239` / `TPS26750` I2C PDO + $V_{\text{min,tail}}$ from FPGA | Adjusts $V_{\text{buck}} \in [3.50\text{V}, 5.00\text{V}]$ via I2C DAC trim; sends active $V_{\text{buck}}$, $P_{\text{max}}$, and $I_{\text{max}}$ to FPGA over UART. | Sets power envelope ($65\text{W}–240\text{W}$ EPR / $800\text{W}$) and minimizes LED linear driver heat dissipation while ensuring tail node $V_{DD} \ge 3.50\text{V}$. |
+| **Tier 2: Frame-by-Frame Hardware ABL** | **FPGA Gateware (`abl_engine.sv`)** | **$60–120\text{ Hz}$ (Every Video Frame, $0\text{ ms}$ lag)** | Exact sum of incoming frame `(R + G + B)` + quiescent power baseline + active $V_{\text{buck}}$ + Tier 1 $I_{\text{max}}$ | Computes 8-bit **`GLOB_SCALE` ($0..255$)** embedded in Byte 2 of every `Chain-Train` frame header. | Allows sparse effects (sparks, text, outlines) to run at **100% full 24-bit brightness**, while smoothly scaling down full-jacket white flashes so total current never exceeds $I_{\text{max}}$. |
 | **Tier 3: Node-Local Autonomous Thermal Derating** | **`TriangleNode` MCU (`PY32F003`)** | $10\text{ Hz}$ per node (autonomous) | On-die `ADC_IN11` temperature sensor referenced against `ADC_IN12` (`VREFINT = 1.20V`) | Multiplies incoming `GLOB_SCALE` by local `thermal_scale` ($100\%$ at $\le 65^\circ\text{C}$, linear ramp to $20\%$ at $85^\circ\text{C}$, $0\%$ cutoff at $90^\circ\text{C}$). | Protects the wearer and PCB even if a single triangle is covered by a backpack strap or if host telemetry is ignored. |
 | **Tier 4: Fast Analog Over-Current Clamp** | **Central Controller MCU (`PY32F003`) + FPGA** | **$20\text{ kHz}$ ADC (`50 µs` response)** | Real-time `BUCK_IMON` analog current sense from the 3× `TI LMG708B0` GaN buck stages (`PA0`) | If $I_{\text{buck}} > 0.95 \times I_{\text{max}}$, asserts `FAST_THROTTLE` pin to FPGA (halving `GLOB_SCALE` on next frame) or pulses `GLOBAL_LED_DE` low. | Prevents transient load spikes or corrupt frames from tripping the USB-PD power bank's hardware OCP fuse. |
 
-### 4.2 FPGA Hardware ABL Math (`GLOB_SCALE` Calculation)
+### 4.2 FPGA Hardware ABL Math with Dynamic Buck Voltage Scaling
 Inside the FPGA's `abl_engine.sv` module, as the $N_{\text{LED}}$ pixels of Frame $f$ stream in from the USB FIFO:
-1. **Quiescent Power Subtraction**:
-   The jacket's electronics and 1010 LED driver ICs draw a baseline quiescent current $I_{\text{idle}}$ (e.g., $\sim 0.35\text{ mA}$ per 1010 LED at $5.0\text{V}$ plus $10\text{ mA}$ per `PY32F003`/`SN65176B` node). The FPGA subtracts $I_{\text{idle}}$ from the available $5\text{V}$ current budget $I_{\text{budget}}$ (which already accounts for the $95\%$ efficiency of the `LMG708B0` GaN buck stage converting $48\text{V} \rightarrow 5.0\text{V}$):
-   $$I_{\text{LED,max}} = \left(\frac{0.95 \times P_{\text{PD,contract}}}{V_{\text{bus,5V}}}\right) - I_{\text{idle}}$$
+1. **Dynamic Voltage-Aware Current Ceiling Calculation**:
+   The Central Controller MCU updates the FPGA with the active buck output voltage $V_{\text{buck}} \in [3.50\text{V}, 5.00\text{V}]$. As $V_{\text{buck}}$ drops, the available LED current for a given USB-PD wattage budget *increases*:
+   $$I_{\text{LED,max}} = \left(\frac{0.95 \times P_{\text{PD,contract}}}{V_{\text{buck}}}\right) - I_{\text{idle}}(V_{\text{buck}})$$
+   *(For example, under a $240\text{W}$ PD budget with $P_{\text{net}} = 228\text{W}$, at $V_{\text{buck}} = 5.0\text{V}$ the available current is $45.6\text{A}$; at $V_{\text{buck}} = 3.8\text{V}$, the available current increases to $60.0\text{A}$! Furthermore, quiescent power $I_{\text{idle}}$ drops linearly with lower supply voltage).*
 2. **Frame RGB Current Integration**:
    Each LED channel (`R, G, B`) draws $I_{\text{ch,max}} \approx 5.0\text{ mA}$ at digital value `255` (after 2.2 gamma expansion, the FPGA uses a 256-entry 16-bit gamma-squared lookup table `gamma_lut[val]` so the current sum reflects the *actual post-gamma LED current* that the `TriangleNode` will drive!):
    $$S_{\text{frame}} = \sum_{i=1}^{N_{\text{LED}}} \Big(\text{gamma\_lut}[R_i] + \text{gamma\_lut}[G_i] + \text{gamma\_lut}[B_i]\Big)$$
@@ -158,6 +162,16 @@ Inside the FPGA's `abl_engine.sv` module, as the $N_{\text{LED}}$ pixels of Fram
      $$\text{GLOB\_SCALE}_{\text{ABL}} = \left\lfloor 255 \times \frac{S_{\text{threshold}}(I_{\text{LED,max}})}{S_{\text{frame}}} \right\rfloor$$
    - Finally, the FPGA applies the Phone's user brightness fader (`USER_BRIGHT`) and any Central Controller thermal derating (`CC_THERM_SCALE`):
      $$\text{GLOB\_SCALE}_{\text{out}} = \frac{\text{GLOB\_SCALE}_{\text{ABL}} \times \text{USER\_BRIGHT} \times \text{CC\_THERM\_SCALE}}{255 \times 255}$$
+
+### 4.3 Physics of Linear Driver Heat Dissipation vs. Dynamic Voltage Scaling (DVS)
+Every addressable 1010 LED package (`TZ-H1010` / `XL-1010RGBC-WS2812B-S`) regulates individual R, G, and B channel currents using **linear constant-current sink transistors**:
+- Forward diode drops: $V_{F,R} \approx 1.9\text{V}$, $V_{F,G} \approx 2.9\text{V}$, $V_{F,B} \approx 3.1\text{V}$.
+- Current sink compliance saturation: $V_{\text{dropout}} \approx 0.3\text{V}$.
+- When the supply rail at the node is $V_{\text{node}}$, the excess voltage across each linear driver is dropped as pure heat:
+  $$P_{\text{heat,linear}} = I_R(V_{\text{node}} - V_{F,R}) + I_G(V_{\text{node}} - V_{F,G}) + I_B(V_{\text{node}} - V_{F,B})$$
+- At $V_{\text{node}} = 5.0\text{V}$: The Red channel dissipates $(5.0\text{V} - 1.9\text{V}) \times I_R = 3.1\text{V} \times I_R$ in heat—meaning **$62\%$ of the electrical energy sent to the Red LED is wasted as fabric heat**!
+- At $V_{\text{node}} = 3.5\text{V}$ (DVS active): The Red channel heat drops to $(3.5\text{V} - 1.9\text{V}) \times I_R = 1.6\text{V} \times I_R$ (a **$48\%$ reduction**), while Green and Blue driver heat dissipation drops by **$67\%$ and $80\%$** respectively!
+- **System Heat Elimination**: By measuring the tail-node voltage at the end of each chain and dynamically trimming $V_{\text{buck}} \in [3.5\text{V}, 5.0\text{V}]$ so that the lowest tail node maintains $V_{\text{min,tail}} \approx 3.50\text{V}$ under the current load, the jacket eliminates over **$55\%$ to $65\%$ of internal garment thermal dissipation**, allowing brighter animations for longer wear without fabric heating.
 
 > [!IMPORTANT]
 > **Why FPGA Hardware ABL + Node Delta-Sigma Dithering is a Breakthrough Combination**:
